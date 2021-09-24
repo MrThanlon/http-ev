@@ -4,12 +4,22 @@
 #include <errno.h>
 
 unsigned int handler(http_context_t* context) {
+    /*
     printf("request %.*s\n", (int)context->request.url.len, context->request.url.data);
     const size_t len = context->request.url.len + 13;
     context->response.body.len = len;
     context->response.body.data = (unsigned char*) malloc(len);
     memcpy(context->response.body.data, "Request URL: ", 13);
     memcpy(context->response.body.data + 13, context->request.url.data, context->request.url.len);
+    */
+    /*
+    context->flags |= HTTP_O_NOT_FREE_RESPONSE_BODY;
+    context->response.body.data = (unsigned char*)"Hello World\n";
+    context->response.body.len = 12;
+
+    fputs("Request: ", stdout);
+    fwrite(context->request.url.data, context->request.url.len, 1, stdout);
+    fputc('\n', stdout);*/
     return 200;
 }
 
@@ -22,6 +32,7 @@ int main(void) {
     server->port = 19134;
     http_register_url(server, "/", handler);
     server->err_handler = err_handler;
+    server->backlog = 100;
     if(http_server_run(server)) {
         perror("Failed to start server");
         return errno;

@@ -72,19 +72,26 @@ enum {
     HTTP_O_NOT_FREE_RESPONSE_HEADER = 0b10,
 };
 
-// TODO: bind address
+// TODO: bind address, limit size
 struct http_server_s {
     struct ev_loop *loop;
     ev_io tcp_watcher;
     int port;
+    int backlog;
     http_url_trie_node_t url_root;
     llhttp_settings_t parser_settings;
     http_err_handler err_handler;
+    int max_connection;
+    size_t limit_url_len;
+    size_t limit_headers_len;
+    size_t limit_header_key_len;
+    size_t limit_header_val_len;
+    size_t limit_body_len;
 };
 
 http_server_t *http_create_server(void);
 int http_server_run(http_server_t *server);
 int http_register_url(http_server_t *server, const char *url, http_handler_t handler);
-int http_register_static_dir(http_server_t *server, const char *url, const char *dir);
+unsigned int http_send_file(http_context_t *context, const char *path, const char *index);
 
 #endif //TEST_C_HTTP_H

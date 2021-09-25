@@ -7,6 +7,8 @@
 
 #include <ev.h>
 #include <llhttp.h>
+#include <semaphore.h>
+#include <pthread.h>
 
 typedef struct http_string_s http_string_t;
 typedef struct http_header_field_s http_header_field_t;
@@ -17,7 +19,11 @@ typedef struct http_url_trie_node_s http_url_trie_node_t;
 typedef struct http_server_s http_server_t;
 typedef enum llhttp_method http_method_t;
 typedef struct http_context_s http_context_t;
-typedef unsigned int (*http_handler_t)(http_context_t* context);
+typedef struct http_fd_queue_s http_fd_queue_t;
+typedef struct http_fd_queue_node_s http_fd_queue_node_t;
+
+typedef unsigned int (*http_handler_t)(http_context_t *context);
+
 typedef void (*http_err_handler)(int err);
 
 struct http_string_s {
@@ -51,7 +57,7 @@ struct http_response_s {
 struct http_context_s {
     ev_io watcher;
     llhttp_t parser;
-    http_server_t* server;
+    http_server_t *server;
     http_request_t request;
     http_response_t response;
     char *buffer;
@@ -72,26 +78,42 @@ enum {
     HTTP_O_NOT_FREE_RESPONSE_HEADER = 0b10,
 };
 
+struct http_fd_queue_node_s {
+    http_fd_queue_node_t *next;
+    int fd;
+};
+
+struct http_fd_queue_s {
+    http_fd_queue_node_t *tail;
+    http_fd_queue_node_t dummy_node;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+};
+
 // TODO: bind address, limit size
 struct http_server_s {
     struct ev_loop *loop;
     ev_io tcp_watcher;
-    int port;
-    int backlog;
     http_url_trie_node_t url_root;
     llhttp_settings_t parser_settings;
     http_err_handler err_handler;
+    http_fd_queue_t fd_queue;
+    // settings
+    int port;
+    int backlog;
     int max_connection;
-    size_t limit_url_len;
-    size_t limit_headers_len;
-    size_t limit_header_key_len;
-    size_t limit_header_val_len;
-    size_t limit_body_len;
+    int max_thread;
+    size_t max_url_len;
+    size_t max_headers_len;
+    size_t max_body_len;
 };
 
 http_server_t *http_create_server(void);
+
 int http_server_run(http_server_t *server);
+
 int http_register_url(http_server_t *server, const char *url, http_handler_t handler);
+
 unsigned int http_send_file(http_context_t *context, const char *path, const char *index);
 
 #endif //TEST_C_HTTP_H

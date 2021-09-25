@@ -20,6 +20,7 @@ unsigned int handler(http_context_t* context) {
     fputs("Request: ", stdout);
     fwrite(context->request.url.data, context->request.url.len, 1, stdout);
     fputc('\n', stdout);*/
+    return http_send_file(context, "/Users/ziyihuang/source/http-ev", "index.html");
     return 200;
 }
 

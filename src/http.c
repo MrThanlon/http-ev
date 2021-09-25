@@ -13,6 +13,13 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#if __APPLE__
+#include <sys/uio.h>
+#elif __linux__
+#include <sys/sendfile.h>
+#endif
 
 #define BUFFER_SIZE 4096
 #define CONTEXT_POOL_SIZE 512
@@ -517,6 +524,51 @@ static void tcp_accept_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
     ev_io_start(loop, &context->watcher);
 }
 
+// TODO: use lock-free queue
+/**
+ * Pop fd from blocking-queue.
+ * @param queue
+ * @return
+ */
+static int queue_pop(http_fd_queue_t *queue) {
+    // use pthread_mutex
+    http_fd_queue_node_t *head = queue->dummy_node.next;
+    pthread_mutex_lock(&queue->lock);
+    while (head != NULL) {
+        pthread_cond_wait(&queue->cond, &queue->lock);
+    }
+    int fd = head->fd;
+    queue->dummy_node.next = head->next;
+    pthread_mutex_unlock(&queue->lock);
+    free(head);
+    return fd;
+}
+
+/**
+ * Push fd to blocking-queue.
+ * @param queue
+ * @param fd
+ */
+static void queue_push(http_fd_queue_t *queue, int fd) {
+    http_fd_queue_node_t *node = (http_fd_queue_node_t *) malloc(sizeof(http_fd_queue_node_t));
+    node->fd = fd;
+    // use pthread_mutex
+    pthread_mutex_lock(&queue->lock);
+    queue->tail->next = node;
+    queue->tail = node;
+    pthread_mutex_unlock(&queue->lock);
+    pthread_cond_signal(&queue->cond);
+}
+
+static void sub_thread_run(http_server_t *server) {
+    http_context_t context;
+    reset_context(&context);
+    while (1) {
+        // reset context
+        int client_fd = queue_pop(&server->fd_queue);
+    }
+}
+
 int http_register_url(http_server_t *server, const char *url, http_handler_t handler) {
     // url[0] must be '/'
     if (url[0] != '/') {
@@ -545,46 +597,160 @@ int http_register_url(http_server_t *server, const char *url, http_handler_t han
     return 0;
 }
 
-// TODO: register URL as static directories, use sendfile()
+/**
+ * Handle static directories, return 404 if not found.
+ * @param context
+ * @param path Must be absolute path, `/a/b/c` for example.
+ * @param index Default index, `index.html` for example, NULL if not used.
+ * @return status code
+ */
 unsigned int http_send_file(http_context_t *context, const char *path, const char *index) {
-    // simplify path
+    // simplify URL path
     const char *cur = ".";
     const char *fa = "..";
-    size_t stack[100];
+    const size_t STACK_MAX = PATH_MAX / 2;
+    size_t stack_head[STACK_MAX];
+    size_t stack_len[STACK_MAX];
     size_t stack_ptr = 0;
     size_t st = 1;
     unsigned char *url = context->request.url.data;
-    for (size_t i = 1; i < context->request.url.len; i++) {
+    // FIXME: edge condition
+    for (size_t i = 1; i <= context->request.url.len; i++) {
         if (url[i] != '/' && url[i - 1] == '/') {
+            // start dir
             st = i;
-        } else if (url[i] == '/' && url[i - 1] != '/') {
-            // end, push
+        } else if ((url[i] == '/' && url[i - 1] != '/') || (i == context->request.url.len)) {
+            // end
             if (i - st == 2 && url[st] == '.' && url[st + 1] == '.') {
-                // father
+                // return to father, pop
                 stack_ptr = stack_ptr > 0 ? stack_ptr - 1 : 0;
+            } else if (i - st == 1 && url[st] == '.') {
+                // current, do nothing
             } else {
-                stack[stack_ptr++] = st;
+                // push
+                stack_head[stack_ptr] = st;
+                stack_len[stack_ptr++] = i - st;
             }
         }
     }
     // generate path string
-    char url_path[104];
+    char real_path[PATH_MAX];
     size_t path_ptr = 0;
+    // push default path
+    for (; path[path_ptr] != '\0'; path_ptr++) {
+        if (path_ptr >= PATH_MAX) {
+            // too long
+            return 400;
+        }
+        real_path[path_ptr] = path[path_ptr];
+    }
+    // append url path
     for (size_t i = 0; i < stack_ptr; i++) {
-        for (size_t j = stack[i]; url[j] != '/'; j++) {
-            url_path[path_ptr++] = (char) url[j];
-            if (path_ptr >= 104) {
-                // too long, return 400
-                return 400;
+        real_path[path_ptr++] = '/';
+        if (path_ptr + stack_len[i] >= PATH_MAX) {
+            return 400;
+        }
+        memcpy(real_path + path_ptr, url + stack_head[i], stack_len[i]);
+        path_ptr += stack_len[i];
+    }
+    real_path[path_ptr] = '\0';
+    // check file and get length
+    struct stat file_stat;
+    int err = stat(real_path, &file_stat);
+    if (err == EFAULT) {
+        // invalid address
+        return 404;
+    } else if (err) {
+        return 500;
+    }
+    if (S_ISREG(file_stat.st_mode)) {
+        // file, do nothing
+    } else if (S_ISDIR(file_stat.st_mode)) {
+        // directories, append index and retry
+        if (real_path[path_ptr - 1] != '/') {
+            real_path[path_ptr++] = '/';
+            if (path_ptr >= PATH_MAX) {
+                return 404;
             }
         }
-        url_path[path_ptr++] = '/';
-        if (path_ptr >= 104) {
-            // too long, break
-            break;
+        if (index == NULL) {
+            // access directories is forbidden
+            return 403;
         }
+        // append index
+        for (size_t i = 0; index[i] != '\0'; i++) {
+            real_path[path_ptr++] = index[i];
+            if (path_ptr >= PATH_MAX) {
+                return 404;
+            }
+        }
+        if (stat(real_path, &file_stat)) {
+            return 500;
+        }
+    } else {
+        // not found
+        return 404;
     }
-    // check file and get length
+    int fd = open(real_path, O_RDONLY);
+    if (fd < 0) {
+        return 404;
+    }
+#if __APPLE__ || __linux__
+    // use sendfile, it will handle all context, send header
+    char headers[100];
+    size_t headers_len = sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\n\r\n", file_stat.st_size);
+    size_t headers_ptr = 0;
+    do {
+        headers_ptr += write(context->watcher.fd, headers + headers_ptr, headers_len - headers_ptr);
+    } while (headers_ptr < headers_len);
+    context->ready_to_close = 0x7f;
+#endif
+
+    // macOS and linux `sendfile` is different.
+#if __APPLE__
+    off_t file_len = file_stat.st_size;
+    off_t file_ptr = 0;
+    struct sf_hdtr hdtr = {
+            .headers = NULL,
+            .hdr_cnt = 0,
+            .trailers = NULL,
+            .trl_cnt = 0
+    };
+    do {
+        err = sendfile(fd, context->watcher.fd, file_ptr, &file_len, &hdtr, 0);
+        if (err != 0 && err != EAGAIN) {
+            // error
+            close(fd);
+            if (context->server->err_handler != NULL) {
+                context->server->err_handler(err);
+            }
+            return 500;
+        }
+        file_ptr += file_len;
+        file_len = file_stat.st_size - file_len;
+    } while (file_ptr < file_stat.st_size);
+#elif __linux__
+    size_t file_len = file_stat.st_size;
+    off_t file_ptr = 0;
+    do {
+        err = sendfile(context->watcher.fd, fd, &file_ptr, file_len);
+        if (err != 0 && err != EAGAIN) {
+            close(fd);
+            if (context->server->err_handler != NULL) {
+                context->server->err_handler(err);
+            }
+            return 500;
+        }
+        file_len -= file_ptr;
+    } while (file_ptr < file_stat.st_size);
+    context->ready_to_close = 0x7f;
+#else
+    // read all to context
+    context->response.body.data = malloc(file_stat.st_size);
+    context->response.body.len = file_stat.st_size;
+    read(fd, context->response.body.data, file_stat.st_size);
+#endif
+    close(fd);
     return 200;
 }
 
@@ -595,8 +761,6 @@ http_server_t *http_create_server(void) {
         return server;
     }
     server->loop = EV_DEFAULT;
-    server->port = 80;
-    server->backlog = 64;
     llhttp_settings_init(&server->parser_settings);
     server->parser_settings.on_url = url_cb;
     server->parser_settings.on_header_field = header_field_cb;
@@ -604,12 +768,26 @@ http_server_t *http_create_server(void) {
     server->parser_settings.on_body = body_cb;
     server->parser_settings.on_message_complete = message_complete_cb;
     server->err_handler = NULL;
+    // init queue
+    server->fd_queue.dummy_node.next = NULL;
+    server->fd_queue.tail = &server->fd_queue.dummy_node;
+    if (pthread_mutex_init(&server->fd_queue.lock, NULL)) {
+        // failed
+        free(server);
+        return NULL;
+    }
+    if (pthread_cond_init(&server->fd_queue.cond, NULL)) {
+        free(server);
+        return NULL;
+    }
+    // default settings
+    server->port = 80;
+    server->backlog = 64;
     server->max_connection = 1024;
-    server->limit_url_len = 4096;
-    server->limit_headers_len = 64;
-    server->limit_header_key_len = 64;
-    server->limit_header_val_len = 1024;
-    server->limit_body_len = 1048576;
+    server->max_thread = 4;
+    server->max_url_len = 4096;
+    server->max_headers_len = 64;
+    server->max_body_len = 1048576;
     return server;
 }
 

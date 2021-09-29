@@ -54,12 +54,22 @@ struct http_response_s {
     http_string_t body;
 };
 
+typedef enum {
+    HTTP_CONTEXT_STATE_PARSING = 0,
+    HTTP_CONTEXT_STATE_HANDLING,
+    HTTP_CONTEXT_STATE_RESPONSE,
+    HTTP_CONTEXT_STATE_CLOSED
+} http_context_state_t;
+
 struct http_context_s {
     ev_io watcher;
     llhttp_t parser;
     http_server_t *server;
     http_request_t request;
     http_response_t response;
+    http_context_state_t state;
+    ev_io write_watcher;
+    size_t write_ptr;
     char *buffer;
     size_t buffer_ptr;
     size_t buffer_capacity;
@@ -71,11 +81,6 @@ struct http_url_trie_node_s {
     // code for 37(%) to 126(~)
     http_url_trie_node_t *children[89];
     http_handler_t handler;
-};
-
-enum {
-    HTTP_O_NOT_FREE_RESPONSE_BODY = 0b1,
-    HTTP_O_NOT_FREE_RESPONSE_HEADER = 0b10,
 };
 
 struct http_fd_queue_node_s {
@@ -101,11 +106,12 @@ struct http_server_s {
     // settings
     int port;
     int backlog;
-    int max_connection;
-    int max_thread;
+    unsigned int multi_process;
+    // not recommend
+    unsigned int multi_thread;
     size_t max_url_len;
-    size_t max_headers_len;
-    size_t max_body_len;
+    size_t max_headers_size;
+    size_t max_body_size;
 };
 
 http_server_t *http_create_server(void);

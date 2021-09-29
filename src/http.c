@@ -15,10 +15,16 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+
 #if __APPLE__
+
 #include <sys/uio.h>
+
 #elif __linux__
+
 #include <sys/sendfile.h>
+#include <sys/prctl.h>
+
 #endif
 
 #define BUFFER_SIZE 4096
@@ -29,7 +35,11 @@ static http_context_t *get_context_from_parser(llhttp_t *parser) {
     return (http_context_t *) ((void *) parser - offsetof(http_context_t, parser));
 }
 
-static char *get_status_message(unsigned int status) {
+static http_context_t *get_context_from_write_watcher(ev_io *write_watcher) {
+    return (http_context_t *) ((void *) write_watcher - offsetof(http_context_t, write_watcher));
+}
+
+static const char *get_status_message(unsigned int status) {
     switch (status) {
         case 100:
             return "Continue";
@@ -170,6 +180,7 @@ static char *get_status_message(unsigned int status) {
  */
 static void reset_context(http_context_t *context) {
     context->ready_to_close = 0;
+    context->state = HTTP_CONTEXT_STATE_PARSING;
     // reset parser
     llhttp_reset(&context->parser);
     // reset buffer, but not free memory
@@ -192,12 +203,6 @@ ev_timer timer_watcher;
  * @param context
  */
 static void free_context(http_context_t *context) {
-    if (!(context->flags | HTTP_O_NOT_FREE_RESPONSE_BODY) && (context->response.body.data != NULL)) {
-        free(context->response.body.data);
-    }
-    if (!(context->flags | HTTP_O_NOT_FREE_RESPONSE_HEADER) && (context->response.headers.fields != NULL)) {
-        free(context->response.headers.fields);
-    }
     free(context->request.headers.fields);
     free(context->buffer);
     free(context);
@@ -214,19 +219,12 @@ static void timer_cb(struct ev_loop *loop, ev_timer *watcher, int revents) {
         ev_timer_again(loop, watcher);
     }
 }
-// TODO: use a better free policy
+// TODO: use a better free policy, use lock-free queue
 /**
  * Recycle used context to pool.
  * @param context
  */
 static void recycle_context(http_context_t *context) {
-    // free response memory
-    if (!(context->flags | HTTP_O_NOT_FREE_RESPONSE_BODY) && (context->response.body.data != NULL)) {
-        free(context->response.body.data);
-    }
-    if (!(context->flags | HTTP_O_NOT_FREE_RESPONSE_HEADER) && (context->response.headers.fields != NULL)) {
-        free(context->response.headers.fields);
-    }
     // recycle
     if (pool_ptr < CONTEXT_POOL_SIZE) {
         reset_context(context);
@@ -301,6 +299,24 @@ static void close_context(http_context_t *context) {
     free(context);*/
 }
 
+static void tcp_write_cb(struct ev_loop *loop, ev_io *watcher, int revents) {
+    http_context_t *context = get_context_from_write_watcher(watcher);
+}
+
+/**
+ * Call this to indicate handle finished.
+ * @param context
+ */
+void http_next(http_context_t *context) {
+    context->state = HTTP_CONTEXT_STATE_RESPONSE;
+    // TODO: generate header string
+    // TODO: write callback
+}
+
+/**
+ * Dispatch context to handler. TODO: update
+ * @param context
+ */
 static void http_dispatch(http_context_t *context) {
     // search url
     http_url_trie_node_t *node = &context->server->url_root;
@@ -333,10 +349,17 @@ static void http_dispatch(http_context_t *context) {
                     context->response.headers.fields[i].value.data
             );
         }
-        // Content-Length
-        fprintf(socket_f, "Content-Length: %zu\r\n\r\n", context->response.body.len);
         // body
-        fwrite(context->response.body.data, context->response.body.len, 1, socket_f);
+        if (status != 200 && context->response.body.len == 0) {
+            // FIXME: default err body
+            // Content-Length
+            fprintf(socket_f, "Content-Length: %zu\r\n\r\n", strlen(get_status_message(status)));
+            fputs(get_status_message(status), socket_f);
+        } else {
+            // Content-Length
+            fprintf(socket_f, "Content-Length: %zu\r\n\r\n", context->response.body.len);
+            fwrite(context->response.body.data, context->response.body.len, 1, socket_f);
+        }
         fclose(socket_f);
     } else {
         // 404
@@ -597,6 +620,95 @@ int http_register_url(http_server_t *server, const char *url, http_handler_t han
     return 0;
 }
 
+
+struct trie_node {
+    // 0-9a-z
+    struct trie_node *child[36];
+    const char *text;
+};
+
+static void build_trie(struct trie_node *root, const char *pat, const char *text) {
+    struct trie_node *ptr = root;
+    for (int i = 0; pat[i] != '\0'; i++) {
+        char c = pat[i];
+        if (c <= '9') {
+            c -= '0';
+        } else {
+            // c = c - 'a' + 10;
+            c -= 'a' - 10;
+        }
+        if (ptr->child[c] == NULL) {
+            // new node
+            ptr->child[c] = (struct trie_node *) malloc(sizeof(struct trie_node));
+            bzero(ptr->child[c], sizeof(struct trie_node));
+        }
+        ptr = ptr->child[c];
+    }
+    ptr->text = text;
+}
+
+/**
+ * Get MIME type string from postfix.
+ * @param postfix_name
+ * @return MIME type string.
+ */
+static const char *get_mime_string(const char *postfix_name) {
+    // generate trie
+    static struct trie_node *root = NULL;
+    if (root == NULL) {
+        root = (struct trie_node *) malloc(sizeof(struct trie_node));
+        bzero(root, sizeof(struct trie_node));
+        build_trie(root, "html", "text/html");
+        build_trie(root, "htm", "text/html");
+        build_trie(root, "shtml", "text/html");
+        build_trie(root, "css", "text/css");
+        build_trie(root, "js", "text/javascript");
+        build_trie(root, "txt", "text/plain");
+        build_trie(root, "gif", "image/gif");
+        build_trie(root, "png", "image/png");
+        build_trie(root, "jpg", "image/jpeg");
+        build_trie(root, "jpeg", "image/jpeg");
+        build_trie(root, "tif", "image/tiff");
+        build_trie(root, "tiff", "image/tiff");
+        build_trie(root, "svg", "image/svg+xml");
+        build_trie(root, "mp3", "audio/mpeg");
+        build_trie(root, "ogg", "audio/ogg");
+        build_trie(root, "3gp", "video/3gpp");
+        build_trie(root, "3gpp", "video/3gpp");
+        build_trie(root, "mp4", "video/mp4");
+        build_trie(root, "mpg", "video/mpeg");
+        build_trie(root, "mpeg", "video/mpeg");
+        build_trie(root, "webm", "video/webm");
+        build_trie(root, "mov", "video/quicktime");
+        build_trie(root, "woff", "application/font-woff");
+        build_trie(root, "rss", "application/rss+xml");
+        build_trie(root, "pdf", "application/pdf");
+        build_trie(root, "xml", "application/xml");
+        build_trie(root, "json", "application/json");
+    }
+    // match
+    struct trie_node *ptr = root;
+    for (size_t i = 0; postfix_name[i] != '\0'; i++) {
+        char c = postfix_name[i];
+        if (c <= '9' && c >= '0') {
+            c -= '0';
+        } else if (c >= 'a' && c <= 'z') {
+            // c = c - 'a' + 10;
+            c -= 'a' - 10;
+        } else if (c >= 'A' && c <= 'Z') {
+            c -= 'A' - 10;
+        } else {
+            // application/octet-stream for unknown
+            return "application/octet-stream";
+        }
+        ptr = ptr->child[c];
+        if (ptr == NULL) {
+            return "application/octet-stream";
+        }
+    }
+    return ptr->text;
+}
+
 /**
  * Handle static directories, return 404 if not found.
  * @param context
@@ -656,12 +768,9 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     real_path[path_ptr] = '\0';
     // check file and get length
     struct stat file_stat;
-    int err = stat(real_path, &file_stat);
-    if (err == EFAULT) {
-        // invalid address
+    if (stat(real_path, &file_stat)) {
+        // not found
         return 404;
-    } else if (err) {
-        return 500;
     }
     if (S_ISREG(file_stat.st_mode)) {
         // file, do nothing
@@ -674,18 +783,18 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
             }
         }
         if (index == NULL) {
-            // access directories is forbidden
+            // forbidden
             return 403;
         }
         // append index
         for (size_t i = 0; index[i] != '\0'; i++) {
             real_path[path_ptr++] = index[i];
             if (path_ptr >= PATH_MAX) {
-                return 404;
+                return 400;
             }
         }
         if (stat(real_path, &file_stat)) {
-            return 500;
+            return 403;
         }
     } else {
         // not found
@@ -695,13 +804,22 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     if (fd < 0) {
         return 404;
     }
+    // get MIME for Content-Type
+    size_t postfix_dot = path_ptr;
+    for (; postfix_dot >= 0 && real_path[postfix_dot] != '.' && real_path[postfix_dot] != '/'; postfix_dot--);
+    postfix_dot += 1;
+
 #if __APPLE__ || __linux__
     // use sendfile, it will handle all context, send header
-    char headers[100];
-    size_t headers_len = sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %lld\r\n\r\n", file_stat.st_size);
+    char headers_str[100];
+    size_t headers_len = sprintf(
+            headers_str,
+            "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\n\r\n",
+            get_mime_string(real_path + postfix_dot),
+            file_stat.st_size);
     size_t headers_ptr = 0;
     do {
-        headers_ptr += write(context->watcher.fd, headers + headers_ptr, headers_len - headers_ptr);
+        headers_ptr += write(context->watcher.fd, headers_str + headers_ptr, headers_len - headers_ptr);
     } while (headers_ptr < headers_len);
     context->ready_to_close = 0x7f;
 #endif
@@ -717,7 +835,7 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
             .trl_cnt = 0
     };
     do {
-        err = sendfile(fd, context->watcher.fd, file_ptr, &file_len, &hdtr, 0);
+        int err = sendfile(fd, context->watcher.fd, file_ptr, &file_len, &hdtr, 0);
         if (err != 0 && err != EAGAIN) {
             // error
             close(fd);
@@ -733,7 +851,7 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     size_t file_len = file_stat.st_size;
     off_t file_ptr = 0;
     do {
-        err = sendfile(context->watcher.fd, fd, &file_ptr, file_len);
+        int err = sendfile(context->watcher.fd, fd, &file_ptr, file_len);
         if (err != 0 && err != EAGAIN) {
             close(fd);
             if (context->server->err_handler != NULL) {
@@ -745,8 +863,22 @@ unsigned int http_send_file(http_context_t *context, const char *path, const cha
     } while (file_ptr < file_stat.st_size);
     context->ready_to_close = 0x7f;
 #else
-    // read all to context
-    context->response.body.data = malloc(file_stat.st_size);
+    // set Content-Type
+    static http_header_field_t *content_type = NULL;
+    if (content_type == NULL) {
+        content_type = (http_header_field_t *) malloc(sizeof(http_header_field_t));
+        content_type->key.data = (unsigned char *) "Content-Type";
+        content_type->key.len = strlen("Content-Type");
+    }
+    const char* content_type_str = get_mime_string(real_path + postfix_dot);
+    content_type->value.data = (unsigned char *) content_type_str;
+    content_type->value.len = strlen(content_type_str);
+    context->response.headers.len = 1;
+    context->response.headers.fields = content_type;
+    // read all to context body
+    if (context->response.body.len < file_stat.st_size) {
+        context->response.body.data = (unsigned char *) realloc(context->response.body.data, file_stat.st_size);
+    }
     context->response.body.len = file_stat.st_size;
     read(fd, context->response.body.data, file_stat.st_size);
 #endif
@@ -783,12 +915,23 @@ http_server_t *http_create_server(void) {
     // default settings
     server->port = 80;
     server->backlog = 64;
-    server->max_connection = 1024;
-    server->max_thread = 4;
+    server->multi_process = 0; // disable multi-process
+    server->multi_thread = 0; // disable multi-thread
     server->max_url_len = 4096;
-    server->max_headers_len = 64;
-    server->max_body_len = 1048576;
+    server->max_headers_size = 102400; // 100K
+    server->max_body_size = 1048576; // 1M
     return server;
+}
+
+void sig_handler(int sig) {
+    // FIXME: close socket fd
+#if __APPLE__
+    // kill all child process
+    kill(0, sig);
+#elif __linux__
+    // do nothing, child process will handle
+#endif
+    exit(sig);
 }
 
 int http_server_run(http_server_t *server) {
@@ -820,14 +963,91 @@ int http_server_run(http_server_t *server) {
         return errno;
     }
     if (set_non_block(socket_fd)) {
+        close(socket_fd);
         if (server->err_handler != NULL) {
             server->err_handler(errno);
         }
         return errno;
     }
-    // join loop
-    ev_io_init(&server->tcp_watcher, tcp_accept_cb, socket_fd, EV_READ);
-    ev_io_start(server->loop, &server->tcp_watcher);
-    // run loop
-    return ev_run(server->loop, 0);
+    if (server->multi_process) {
+        // TODO: multi-process architecture, fork()
+        // create process group for killing
+        if (setpgid(0, 0)) {
+            if (server->err_handler != NULL) {
+                server->err_handler(errno);
+            }
+            return errno;
+        }
+        // fork
+        int pid;
+        char is_master_process = 0;
+        for (unsigned int i = 0; i < server->multi_process; i++) {
+            pid = fork();
+            if (pid < 0) {
+                // err
+                if (server->err_handler != NULL) {
+                    server->err_handler(pid);
+                }
+                // kill all child process
+                kill(0, SIGINT);
+                return pid;
+            } else if (pid == 0) {
+                // child process
+#if __linux__
+                prctl(PR_SET_PDEATHSIG, SIGINT);
+#endif
+                is_master_process = 0;
+                // run loop
+                ev_io_init(&server->tcp_watcher, tcp_accept_cb, socket_fd, EV_READ);
+                ev_io_start(server->loop, &server->tcp_watcher);
+                // run loop
+                return ev_run(server->loop, 0);
+            } else {
+                // master process
+                is_master_process = 1;
+            }
+        }
+        if (is_master_process) {
+            // handle SIGINT
+            signal(SIGINT, sig_handler);
+            signal(SIGTERM, sig_handler);
+            while (1) {
+                // wait child process exit
+                pid_t child_pid = -1;
+                pid_t exit_pid = wait(&child_pid);
+                if (exit_pid < 0) {
+                    // err
+                } else {
+                    // spawn a new process, FIXME: duplicate code
+                    pid = fork();
+                    if (pid < 0) {
+                        // err
+                        if (server->err_handler != NULL) {
+                            server->err_handler(pid);
+                        }
+                        return pid;
+                    } else if (pid == 0) {
+                        // child process
+#if __linux__
+                        prctl(PR_SET_PDEATHSIG, SIGINT);
+#endif
+                        is_master_process = 0;
+                        // run loop
+                        ev_io_init(&server->tcp_watcher, tcp_accept_cb, socket_fd, EV_READ);
+                        ev_io_start(server->loop, &server->tcp_watcher);
+                        // run loop
+                        return ev_run(server->loop, 0);
+                    }
+                }
+            }
+        }
+        return 0;
+    } else {
+        // single process
+        // join loop
+        ev_io_init(&server->tcp_watcher, tcp_accept_cb, socket_fd, EV_READ);
+        ev_io_start(server->loop, &server->tcp_watcher);
+        // run loop
+        return ev_run(server->loop, 0);
+    }
 }
